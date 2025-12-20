@@ -1,4 +1,6 @@
 import os
+import sys
+import uvicorn
 import shutil
 import logging
 from typing import List, Optional
@@ -13,6 +15,7 @@ from google import genai
 from google.genai import types
 
 # --- Configuration ---
+print("DEBUG: Loading environment variables...", flush=True)
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PROFILE_PATH = "rohit_portfolio_profile_full.md"
@@ -64,14 +67,19 @@ class RAGEngine:
         if not api_key:
             raise ValueError("GEMINI_API_KEY is missing!")
         
+        print(f"DEBUG: Initializing GenAI Client...", flush=True)
         self.client = genai.Client(api_key=api_key)
         self.profile_path = profile_path
         
         # Initialize LanceDB
+        print(f"DEBUG: Connecting to LanceDB at {db_path}...", flush=True)
         self.db = lancedb.connect(db_path)
+        print("DEBUG: LanceDB connected.", flush=True)
+
         self.table_name = "profile_chunks"
         self.table = None
         
+        print("DEBUG: Initializing Knowledge Base...", flush=True)
         self._initialize_knowledge_base()
 
     def _get_embedding(self, text: str) -> List[float]:
@@ -110,9 +118,11 @@ class RAGEngine:
 
         raw_chunks = split_markdown_into_chunks(full_text)
         logger.info(f"Split profile into {len(raw_chunks)} chunks. Generating embeddings...")
+        print(f"DEBUG: Found {len(raw_chunks)} chunks. Starting embedding generation...", flush=True)
 
         data = []
         for i, text in enumerate(raw_chunks):
+            print(f"DEBUG: Processing chunk {i+1}/{len(raw_chunks)}...", flush=True)
             embedding = self._get_embedding(text)
             if embedding:
                 data.append(Chunk(id=i, text=text, vector=embedding))
@@ -122,6 +132,7 @@ class RAGEngine:
             self.table = self.db.create_table(self.table_name, schema=Chunk, mode="overwrite")
             self.table.add(data)
             logger.info(f"Ingested {len(data)} chunks into LanceDB.")
+            print(f"DEBUG: Successfully ingested {len(data)} chunks.", flush=True)
         else:
             logger.error("No data could be ingested.")
 
@@ -193,7 +204,9 @@ async def startup_event():
     global rag_engine
     if GEMINI_API_KEY:
         try:
+            print("DEBUG: Starting up RAGEngine...", flush=True)
             rag_engine = RAGEngine(GEMINI_API_KEY, PROFILE_PATH, LANCEDB_PATH)
+            print("DEBUG: RAGEngine initialized successfully.", flush=True)
         except Exception as e:
             logger.error(f"Failed to initialize RAG Engine: {e}")
     else:
@@ -212,3 +225,7 @@ def chat(payload: ChatIn):
 def health():
     ready = rag_engine is not None and rag_engine.table is not None
     return {"status": "ok", "rag_ready": ready}
+
+if __name__ == "__main__":
+    print("DEBUG: Starting server via uvicorn...", flush=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
