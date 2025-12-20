@@ -3,14 +3,15 @@ import sys
 import uvicorn
 import shutil
 import logging
-from typing import List, Optional
+import sqlite3
+import json
+import math
+from typing import List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import lancedb
-from lancedb.pydantic import Vector, LanceModel
 from google import genai
 from google.genai import types
 
@@ -19,26 +20,40 @@ print("DEBUG: Loading environment variables...", flush=True)
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PROFILE_PATH = "rohit_portfolio_profile_full.md"
-LANCEDB_PATH = "data/rag_store"
+DB_PATH = "data/portfolio.db" # Changed to standard .db file
 EMBEDDING_MODEL = "models/text-embedding-004"
-GENERATION_MODEL = "gemini-2.5-flash-lite" 
+GENERATION_MODEL = "gemini-2.5-flash" 
 VECTOR_DIM = 768
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Data Structures (Pydantic + LanceDB) ---
-
-class Chunk(LanceModel):
-    id: int
-    text: str
-    vector: Vector(VECTOR_DIM) # 768-dim vector for text-embedding-004
+# --- Data Structures ---
 
 class ChatIn(BaseModel):
     question: str
 
-# --- Helper Logic: Chunking ---
+class Chunk(BaseModel):
+    id: int
+    text: str
+    vector: List[float]
+
+# --- Helper Logic: Math & Chunking ---
+
+def cosine_similarity(v1: List[float], v2: List[float]) -> float:
+    """Pure Python Cosine Similarity."""
+    if not v1 or not v2 or len(v1) != len(v2):
+        return 0.0
+    
+    dot_product = sum(a * b for a, b in zip(v1, v2))
+    norm_v1 = math.sqrt(sum(a * a for a in v1))
+    norm_v2 = math.sqrt(sum(b * b for b in v2))
+    
+    if norm_v1 == 0 or norm_v2 == 0:
+        return 0.0
+        
+    return dot_product / (norm_v1 * norm_v2)
 
 def split_markdown_into_chunks(text: str) -> List[str]:
     """Splits markdown into logical chunks based on headers."""
@@ -60,7 +75,7 @@ def split_markdown_into_chunks(text: str) -> List[str]:
         
     return [c for c in chunks if c]
 
-# --- Core RAG Logic ---
+# --- Core RAG Logic (SQLite + Python) ---
 
 class RAGEngine:
     def __init__(self, api_key: str, profile_path: str, db_path: str):
@@ -70,14 +85,24 @@ class RAGEngine:
         print(f"DEBUG: Initializing GenAI Client...", flush=True)
         self.client = genai.Client(api_key=api_key)
         self.profile_path = profile_path
+        self.db_path = db_path
         
-        # Initialize LanceDB
-        print(f"DEBUG: Connecting to LanceDB at {db_path}...", flush=True)
-        self.db = lancedb.connect(db_path)
-        print("DEBUG: LanceDB connected.", flush=True)
-
-        self.table_name = "profile_chunks"
-        self.table = None
+        # Initialize DB
+        print(f"DEBUG: Connecting to SQLite at {db_path}...", flush=True)
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        
+        # Create Table
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chunks (
+                id INTEGER PRIMARY KEY,
+                text TEXT,
+                vector_json TEXT
+            )
+        """)
+        self.conn.commit()
+        print("DEBUG: SQLite connected and table verified.", flush=True)
         
         print("DEBUG: Initializing Knowledge Base...", flush=True)
         self._initialize_knowledge_base()
@@ -97,17 +122,18 @@ class RAGEngine:
             return []
 
     def _initialize_knowledge_base(self):
-        """Checks if DB exists; if not, ingests data."""
+        """Checks if DB has data; if not, ingests data."""
         
-        # Check if table exists
-        if self.table_name in self.db.table_names():
-            self.table = self.db.open_table(self.table_name)
-            if len(self.table) > 0:
-                logger.info("LanceDB loaded with existing data.")
-                return
+        self.cursor.execute("SELECT COUNT(*) FROM chunks")
+        count = self.cursor.fetchone()[0]
+        
+        if count > 0:
+            logger.info("SQLite loaded with existing data.")
+            print("DEBUG: SQLite Knowledge Base already populated.", flush=True)
+            return
 
         # If we are here, we need to ingest
-        logger.info("Initializing LanceDB Knowledge Base from Markdown...")
+        logger.info("Initializing Knowledge Base from Markdown...")
         
         if not os.path.exists(self.profile_path):
             logger.warning(f"Profile file not found: {self.profile_path}")
@@ -120,30 +146,40 @@ class RAGEngine:
         logger.info(f"Split profile into {len(raw_chunks)} chunks. Generating embeddings...")
         print(f"DEBUG: Found {len(raw_chunks)} chunks. Starting embedding generation...", flush=True)
 
-        data = []
         for i, text in enumerate(raw_chunks):
             print(f"DEBUG: Processing chunk {i+1}/{len(raw_chunks)}...", flush=True)
             embedding = self._get_embedding(text)
             if embedding:
-                data.append(Chunk(id=i, text=text, vector=embedding))
+                # Store vector as JSON string
+                vector_str = json.dumps(embedding)
+                self.cursor.execute("INSERT INTO chunks (id, text, vector_json) VALUES (?, ?, ?)", (i, text, vector_str))
         
-        if data:
-            # Create or overwrite table
-            self.table = self.db.create_table(self.table_name, schema=Chunk, mode="overwrite")
-            self.table.add(data)
-            logger.info(f"Ingested {len(data)} chunks into LanceDB.")
-            print(f"DEBUG: Successfully ingested {len(data)} chunks.", flush=True)
-        else:
-            logger.error("No data could be ingested.")
+        self.conn.commit()
+        logger.info(f"Ingested {len(raw_chunks)} chunks into SQLite.")
+        print(f"DEBUG: Successfully ingested {len(raw_chunks)} chunks.", flush=True)
 
     def generate_response(self, query: str) -> str:
         # 1. Retrieve
         query_vec = self._get_embedding(query)
-        if not query_vec or not self.table:
+        if not query_vec:
             return "System is not ready or failed to understand the query."
 
-        results = self.table.search(query_vec).limit(4).to_pydantic(Chunk)
-        relevant_texts = [r.text for r in results]
+        # Fetch all chunks (Small dataset makes this okay ~100 rows)
+        self.cursor.execute("SELECT text, vector_json FROM chunks")
+        rows = self.cursor.fetchall()
+        
+        scored_chunks: List[Tuple[float, str]] = []
+        
+        for text, vector_json in rows:
+            chunk_vec = json.loads(vector_json)
+            score = cosine_similarity(query_vec, chunk_vec)
+            scored_chunks.append((score, text))
+            
+        # Sort by score desc
+        scored_chunks.sort(key=lambda x: x[0], reverse=True)
+        top_k = scored_chunks[:4]
+        
+        relevant_texts = [text for score, text in top_k]
         context_str = "\n\n---\n\n".join(relevant_texts)
 
         if not context_str:
@@ -205,10 +241,11 @@ async def startup_event():
     if GEMINI_API_KEY:
         try:
             print("DEBUG: Starting up RAGEngine...", flush=True)
-            rag_engine = RAGEngine(GEMINI_API_KEY, PROFILE_PATH, LANCEDB_PATH)
+            rag_engine = RAGEngine(GEMINI_API_KEY, PROFILE_PATH, DB_PATH) # Updated Init
             print("DEBUG: RAGEngine initialized successfully.", flush=True)
         except Exception as e:
             logger.error(f"Failed to initialize RAG Engine: {e}")
+            print(f"DEBUG: RAGEngine failed: {e}", flush=True)
     else:
         logger.warning("No API Key found. RAG disabled.")
 
@@ -223,7 +260,7 @@ def chat(payload: ChatIn):
 
 @app.get("/health")
 def health():
-    ready = rag_engine is not None and rag_engine.table is not None
+    ready = rag_engine is not None
     return {"status": "ok", "rag_ready": ready}
 
 if __name__ == "__main__":

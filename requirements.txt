@@ -3,4 +3,3 @@ uvicorn
 pydantic
 python-dotenv
 google-genai
-lancedb
