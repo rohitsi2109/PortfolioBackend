@@ -1,0 +1,11 @@
+# Environment Variables
+.env
+
+# Virtual Environment
+myenv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
