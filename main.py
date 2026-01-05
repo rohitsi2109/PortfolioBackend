@@ -230,6 +230,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://rohitsingh.online",
+        "https://www.rohitsingh.online",
         "https://rohit-portfolio-front.vercel.app"
     ],
     allow_methods=["*"],
