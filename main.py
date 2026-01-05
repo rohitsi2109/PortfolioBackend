@@ -22,7 +22,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PROFILE_PATH = "rohit_portfolio_profile_full.md"
 DB_PATH = "data/portfolio.db" # Changed to standard .db file
 EMBEDDING_MODEL = "models/text-embedding-004"
-GENERATION_MODEL = "gemini-2.5-flash" 
+GENERATION_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
 VECTOR_DIM = 768
 
 # Setup Logging
@@ -207,19 +207,29 @@ class RAGEngine:
             f"### AGENT RESPONSE:"
         )
 
-        # 3. Generation
-        try:
-            response = self.client.models.generate_content(
-                model=GENERATION_MODEL,
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    temperature=0.3, 
+        # 3. Generation with Fallback
+        for model_name in GENERATION_MODELS:
+            try:
+                logger.info(f"Attempting generation with model: {model_name}")
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=user_prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        temperature=0.3, 
+                    )
                 )
-            )
-            return response.text
-        except Exception as e:
-            return f"Error generating response: {e}"
+                return response.text
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "429" in error_msg or "quota" in error_msg or "resource_exhausted" in error_msg:
+                    logger.warning(f"Quota exceeded for {model_name}. Trying next model...")
+                    continue
+                else:
+                    logger.error(f"Generation failed with {model_name}: {e}")
+                    return f"Error generating response: {e}"
+        
+        return "All available AI models have reached their quota limits. Please try again later."
 
 
 # --- FastAPI App ---
