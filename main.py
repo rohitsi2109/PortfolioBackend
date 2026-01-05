@@ -229,7 +229,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5174"
+        "http://localhost:5174",
         "https://rohitsingh.online",
         "https://www.rohitsingh.online",
         "https://rohit-portfolio-front.vercel.app"
@@ -267,6 +267,10 @@ def chat(payload: ChatIn):
 def health():
     ready = rag_engine is not None
     return {"status": "ok", "rag_ready": ready}
+
+@app.get("/")
+def read_root():
+    return {"message": "Portfolio Backend is running", "rag_ready": rag_engine is not None}
 
 if __name__ == "__main__":
     print("DEBUG: Starting server via uvicorn...", flush=True)
